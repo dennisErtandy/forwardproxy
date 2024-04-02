@@ -42,6 +42,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/forwardproxy/httpclient"
+	"github.com/juju/ratelimit"
 	"go.uber.org/zap"
 	"golang.org/x/net/proxy"
 )
@@ -83,6 +84,14 @@ type Handler struct {
 
 	// Ports to be allowed to connect to (if non-empty).
 	AllowedPorts []int `json:"allowed_ports,omitempty"`
+
+	// maximum number of bytes to write per second per connection
+	LimitBytePerSecond float64 `json:"limit_byte_per_second,omitempty"`
+
+	//maximum number of bytes to write at once (rate permitting) per connection
+	LimitBurstSize int64 `json:"limit_burst_size,omitempty"`
+
+	limiter *ratelimit.Bucket
 
 	httpTransport *http.Transport
 
@@ -163,6 +172,13 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	h.httpTransport.DialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
 		return h.dialContextCheckACL(ctx, network, address)
 	}
+	if h.LimitBytePerSecond > 0 {
+		if h.LimitBurstSize <= 0 {
+			// default burst size if not specified
+			h.LimitBurstSize = int64(h.LimitBytePerSecond) + 1
+		}
+		h.limiter = ratelimit.NewBucketWithRate(h.LimitBytePerSecond, h.LimitBurstSize)
+	}
 
 	if h.Upstream != "" {
 		upstreamURL, err := url.Parse(h.Upstream)
@@ -231,6 +247,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	if h.AuthCredentials != nil {
 		authErr = h.checkCredentials(r)
 	}
+
 	if h.ProbeResistance != nil && len(h.ProbeResistance.Domain) > 0 && reqHost == h.ProbeResistance.Domain {
 		return serveHiddenPage(w, authErr)
 	}
@@ -238,7 +255,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		// Always pass non-CONNECT requests to hostname
 		// Pass CONNECT requests only if probe resistance is enabled and not authenticated
 		if h.shouldServePACFile(r) {
-			return h.servePacFile(w, r)
+			return h.servePacFile(w, r, h.limiter)
 		}
 		return next.ServeHTTP(w, r)
 	}
@@ -320,12 +337,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 		switch r.ProtoMajor {
 		case 1: // http1: hijack the whole flow
-			return serveHijack(w, targetConn)
+			return serveHijack(w, targetConn, h.limiter)
 		case 2: // http2: keep reading from "request" and writing into same response
 			fallthrough
 		case 3:
 			defer r.Body.Close()
-			return dualStream(targetConn, r.Body, w, r.Header.Get("Padding") != "")
+			return dualStream(targetConn, r.Body, w, r.Header.Get("Padding") != "", h.limiter)
 		}
 
 		panic("There was a check for http version, yet it's incorrect")
@@ -419,7 +436,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			fmt.Errorf("failed to read response: %v", err))
 	}
 
-	return forwardResponse(w, response)
+	return forwardResponse(w, response, h.limiter)
 }
 
 func (h Handler) checkCredentials(r *http.Request) error {
@@ -468,8 +485,8 @@ func (h Handler) shouldServePACFile(r *http.Request) bool {
 	return len(h.PACPath) > 0 && r.URL.Path == h.PACPath
 }
 
-func (h Handler) servePacFile(w http.ResponseWriter, r *http.Request) error {
-	fmt.Fprintf(w, pacFile, r.Host)
+func (h Handler) servePacFile(w http.ResponseWriter, r *http.Request, limiter *ratelimit.Bucket) error {
+	fmt.Fprintf(getLimitedWriter(w, limiter), pacFile, r.Host)
 	// fmt.Fprintf(w, pacFile, h.hostname, h.port)
 	return nil
 }
@@ -592,7 +609,7 @@ func serveHiddenPage(w http.ResponseWriter, authErr error) error {
 
 // Hijacks the connection from ResponseWriter, writes the response and proxies data between targetConn
 // and hijacked connection.
-func serveHijack(w http.ResponseWriter, targetConn net.Conn) error {
+func serveHijack(w http.ResponseWriter, targetConn net.Conn, limiter *ratelimit.Bucket) error {
 	clientConn, bufReader, err := http.NewResponseController(w).Hijack()
 	if err != nil {
 		return caddyhttp.Error(http.StatusInternalServerError,
@@ -623,7 +640,7 @@ func serveHijack(w http.ResponseWriter, targetConn net.Conn) error {
 	res.Header.Set("Server", "Caddy")
 
 	buf := bufio.NewWriter(clientConn)
-	err = res.Write(buf)
+	err = res.Write(getLimitedWriter(buf, limiter))
 	if err != nil {
 		return caddyhttp.Error(http.StatusInternalServerError,
 			fmt.Errorf("failed to write response: %v", err))
@@ -634,7 +651,7 @@ func serveHijack(w http.ResponseWriter, targetConn net.Conn) error {
 			fmt.Errorf("failed to send response to client: %v", err))
 	}
 
-	return dualStream(targetConn, clientConn, clientConn, false)
+	return dualStream(targetConn, clientConn, clientConn, false, limiter)
 }
 
 const (
@@ -647,13 +664,13 @@ const (
 // Copies data target->clientReader and clientWriter->target, and flushes as needed
 // Returns when clientWriter-> target stream is done.
 // Caddy should finish writing target -> clientReader.
-func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, padding bool) error {
+func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, padding bool, limiter *ratelimit.Bucket) error {
 	stream := func(w io.Writer, r io.Reader, paddingType int) error {
 		// copy bytes from r to w
 		bufPtr := bufferPool.Get().(*[]byte)
 		buf := *bufPtr
 		buf = buf[0:cap(buf)]
-		_, _err := flushingIoCopy(w, r, buf, paddingType)
+		_, _err := flushingIoCopy(getLimitedWriter(w, limiter), r, buf, paddingType)
 		bufferPool.Put(bufPtr)
 
 		if cw, ok := w.(closeWriter); ok {
@@ -747,7 +764,7 @@ func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, paddingType int) (
 }
 
 // Removes hop-by-hop headers, and writes response into ResponseWriter.
-func forwardResponse(w http.ResponseWriter, response *http.Response) error {
+func forwardResponse(w http.ResponseWriter, response *http.Response, limiter *ratelimit.Bucket) error {
 	w.Header().Del("Server") // remove Server: Caddy, append via instead
 	w.Header().Add("Via", strconv.Itoa(response.ProtoMajor)+"."+strconv.Itoa(response.ProtoMinor)+" caddy")
 
@@ -756,14 +773,24 @@ func forwardResponse(w http.ResponseWriter, response *http.Response) error {
 			w.Header().Add(header, val)
 		}
 	}
+
 	removeHopByHop(w.Header())
 	w.WriteHeader(response.StatusCode)
 	bufPtr := bufferPool.Get().(*[]byte)
 	buf := *bufPtr
 	buf = buf[0:cap(buf)]
-	_, err := io.CopyBuffer(w, response.Body, buf)
+	_, err := io.CopyBuffer(getLimitedWriter(w, limiter), response.Body, buf)
 	bufferPool.Put(bufPtr)
 	return err
+}
+
+func getLimitedWriter(w io.Writer, limiter *ratelimit.Bucket) io.Writer {
+	var limitedWriter io.Writer
+	limitedWriter = w
+	if limiter != nil {
+		limitedWriter = ratelimit.Writer(w, limiter)
+	}
+	return limitedWriter
 }
 
 func removeHopByHop(header http.Header) {

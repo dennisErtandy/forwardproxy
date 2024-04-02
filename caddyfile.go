@@ -91,6 +91,24 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 			h.HideVia = true
+		case "limit_byte_per_second":
+			if len(args) > 1 {
+				return d.ArgErr()
+			}
+			limitBytePerSecond, err := strconv.ParseFloat(args[0], 64)
+			if err != nil || limitBytePerSecond <= 0 {
+				return d.ArgErr()
+			}
+			h.LimitBytePerSecond = limitBytePerSecond
+		case "limit_burst_size":
+			if len(args) > 1 {
+				return d.ArgErr()
+			}
+			limitBurstSize, err := strconv.Atoi(args[0])
+			if err != nil || limitBurstSize <= 0 {
+				return d.ArgErr()
+			}
+			h.LimitBurstSize = int64(limitBurstSize)
 		case "probe_resistance":
 			if len(args) > 1 {
 				return d.ArgErr()

@@ -105,6 +105,8 @@ route {
 		ports     80 443
 		hide_ip
 		hide_via
+		limit_byte_per_second 5000000 # maximum number of bytes  per second per connection
+		limit_burst_size 10000000 # maximum number of bytes at once (rate permitting) per connection
 		probe_resistance secret-link-kWWL9Q.com # alternatively you can use a real domain, such as caddyserver.com
 		serve_pac        /secret-proxy.pac
 		dial_timeout     30
@@ -216,6 +218,15 @@ Upstream is incompatible with `acl` and `ports` subdirectives.
 Supported schemes to remote host: https.  
 Supported schemes to localhost: socks5, http, https (certificate check is ignored).  
 _Default: no upstream proxy._
+
+- **limit_byte_per_second [float64]**  
+ Limit number of bytes  per second per connection.  
+_Default: not limited._
+
+- **limit_burst_size [float64]**  
+ Limit number of bytes at once (rate permitting) per connection
+_Default: not limited._
+
 
 ## Get forwardproxy
 
